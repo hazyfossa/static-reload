@@ -1,6 +1,6 @@
 use std::{fs, io, path::PathBuf};
 
-use static_reload::{Resource, ResourceCell, kind};
+use static_reload::{Resource, ResourceCell};
 use tokio::signal::unix::SignalKind;
 
 struct FileData(Vec<u8>);
@@ -8,7 +8,6 @@ struct FileData(Vec<u8>);
 impl Resource for FileData {
     type Definition = PathBuf;
     type Error = io::Error;
-    type Kind = kind::Reloadable;
 
     async fn load(path: &Self::Definition) -> Result<Self, Self::Error> {
         let buf = fs::read(path)?;

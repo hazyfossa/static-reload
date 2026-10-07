@@ -1,6 +1,6 @@
 use std::hint::black_box;
 
-use static_reload::{Resource, ResourceCell, ResourceRef};
+use static_reload::{Resource, ResourceCell, kind::ReloadableRef};
 
 pub(crate) struct Noop;
 
@@ -32,11 +32,11 @@ async fn main() {
 }
 
 #[divan::bench]
-fn load_resource() -> ResourceRef<Noop> {
+fn load_resource<'a>() -> ReloadableRef<'a, Noop> {
     black_box(&RESOURCE).require()
 }
 
 #[divan::bench]
-fn load_reloaded_resource() -> ResourceRef<Noop> {
+fn load_reloaded_resource<'a>() -> ReloadableRef<'a, Noop> {
     black_box(&RELOADED_RESOURCE).require()
 }

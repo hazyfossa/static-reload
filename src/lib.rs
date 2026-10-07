@@ -38,23 +38,25 @@ pub mod kind {
     }
 
     // Store resource definition inline to allow for updates
-    pub struct ReloadablePointer<T: Resource> {
+    pub struct ReloadableMeta<T: Resource> {
         pub(crate) definition: T::Definition,
         pub(crate) cached_ptr: hazarc::Cache<AtomicArc<T>>,
     }
 
+    pub type ReloadableRef<'a, T> = CachedOrReloaded<'a, Arc<T>>;
+
     pub struct Reloadable;
     impl Sealed for Reloadable {}
     impl T for Reloadable {
-        type Body<T: Resource> = ReloadablePointer<T>;
-        type ResourceRef<'a, T: 'a> = CachedOrReloaded<'a, Arc<T>>;
+        type Body<T: Resource> = ReloadableMeta<T>;
+        type ResourceRef<'a, T: 'a> = ReloadableRef<'a, T>;
 
         fn define<T: Resource>(definition: T::Definition, instance: T) -> Self::Body<T> {
             let ptr = Arc::new(instance);
             let hazard_ptr = AtomicArc::new(ptr);
             let cached_ptr = Cache::new(hazard_ptr);
 
-            ReloadablePointer {
+            ReloadableMeta {
                 definition,
                 cached_ptr,
             }
@@ -77,7 +79,6 @@ pub mod kind {
 pub trait Resource: Sized {
     type Definition;
     type Error;
-    type Kind: kind::T; // TODO: also consider const-generic bool RELOADABLE
 
     fn name() -> &'static str {
         type_name::<Self>()
@@ -86,11 +87,11 @@ pub trait Resource: Sized {
     async fn load(definition: &Self::Definition) -> Result<Self, Self::Error>;
 }
 
-pub struct ResourceCell<T: Resource + 'static> {
-    cell: OnceLock<<T::Kind as kind::T>::Body<T>>,
+pub struct ResourceCell<T: Resource + 'static, Kind: kind::T = kind::Reloadable> {
+    cell: OnceLock<Kind::Body<T>>,
 }
 
-impl<T: Resource> ResourceCell<T> {
+impl<T: Resource, Kind: kind::T> ResourceCell<T, Kind> {
     pub const fn new() -> Self {
         Self {
             cell: OnceLock::new(),
@@ -101,7 +102,7 @@ impl<T: Resource> ResourceCell<T> {
     /// It is recommended to call it from `main`
     pub async fn init(&self, definition: T::Definition) -> Result<(), T::Error> {
         let instance = T::load(&definition).await?;
-        let body = <T::Kind as kind::T>::define(definition, instance);
+        let body = Kind::define(definition, instance);
 
         let ret = self.cell.set(body);
         if ret.is_err() {
@@ -111,7 +112,7 @@ impl<T: Resource> ResourceCell<T> {
         Ok(())
     }
 
-    fn expect_init(&self) -> &<T::Kind as kind::T>::Body<T> {
+    fn expect_init(&self) -> &Kind::Body<T> {
         self.cell
             .get()
             .expect(&format!("'{}' not initialized", T::name()))
@@ -124,13 +125,13 @@ impl<T: Resource> ResourceCell<T> {
     ///
     /// For hot-reloaded data, performance is comparable to
     /// loading from arc-swap (still very fast)
-    pub fn require(&self) -> <T::Kind as kind::T>::ResourceRef<'_, T> {
+    pub fn require(&self) -> Kind::ResourceRef<'_, T> {
         let this = self.expect_init();
-        <T::Kind as kind::T>::load(&this)
+        Kind::load(&this)
     }
 }
 
-impl<T: Resource<Kind = kind::Reloadable>> ResourceCell<T> {
+impl<T: Resource> ResourceCell<T, kind::Reloadable> {
     pub fn manual_update(&self, new: T) {
         let this = self.expect_init();
 
