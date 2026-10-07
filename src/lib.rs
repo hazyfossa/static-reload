@@ -1,18 +1,12 @@
-use std::{
-    any::type_name,
-    sync::{Arc, OnceLock},
-};
+use std::{any::type_name, sync::OnceLock};
+
+mod private {
+    pub trait Sealed {}
+}
 
 pub mod kind {
-    use std::sync::Arc;
-
-    use hazarc::{AtomicArc, Cache, atomic::CachedOrReloaded};
+    use super::*;
     use private::Sealed;
-
-    use crate::Resource;
-    mod private {
-        pub trait Sealed {}
-    }
 
     pub trait T: Sealed {
         type Body<T: Resource>;
@@ -37,36 +31,12 @@ pub mod kind {
         }
     }
 
-    // Store resource definition inline to allow for updates
-    pub struct ReloadableMeta<T: Resource> {
-        pub(crate) definition: T::Definition,
-        pub(crate) cached_ptr: hazarc::Cache<AtomicArc<T>>,
-    }
-
-    pub type ReloadableRef<'a, T> = CachedOrReloaded<'a, Arc<T>>;
-
+    #[cfg(feature = "reload")]
     pub struct Reloadable;
-    impl Sealed for Reloadable {}
-    impl T for Reloadable {
-        type Body<T: Resource> = ReloadableMeta<T>;
-        type ResourceRef<'a, T: 'a> = ReloadableRef<'a, T>;
-
-        fn define<T: Resource>(definition: T::Definition, instance: T) -> Self::Body<T> {
-            let ptr = Arc::new(instance);
-            let hazard_ptr = AtomicArc::new(ptr);
-            let cached_ptr = Cache::new(hazard_ptr);
-
-            ReloadableMeta {
-                definition,
-                cached_ptr,
-            }
-        }
-
-        fn load<'a, T: Resource>(ptr: &Self::Body<T>) -> Self::ResourceRef<'_, T> {
-            ptr.cached_ptr.load_shared()
-        }
-    }
 }
+
+#[cfg(feature = "reload")]
+pub mod reload;
 
 // TODO: if we abandon Cache, we can return fully owned ArcBorrows from read,
 // turning resources from `static` to `const`
@@ -128,26 +98,6 @@ impl<T: Resource, Kind: kind::T> ResourceCell<T, Kind> {
     pub fn require(&self) -> Kind::ResourceRef<'_, T> {
         let this = self.expect_init();
         Kind::load(&this)
-    }
-}
-
-impl<T: Resource> ResourceCell<T, kind::Reloadable> {
-    pub fn manual_update(&self, new: T) {
-        let this = self.expect_init();
-
-        let new_ptr = Arc::new(new);
-        this.cached_ptr.inner().store(new_ptr);
-    }
-
-    pub async fn reload(&self) -> Result<(), T::Error> {
-        let this = self.expect_init();
-
-        let new_instance = T::load(&this.definition).await?;
-        let new_ptr = Arc::new(new_instance);
-
-        this.cached_ptr.inner().store(new_ptr);
-
-        Ok(())
     }
 }
 
