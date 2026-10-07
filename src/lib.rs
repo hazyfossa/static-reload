@@ -3,10 +3,71 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use hazarc::{AtomicArc, Cache, atomic::CachedOrReloaded};
+pub mod kind {
+    use std::sync::Arc;
+
+    use hazarc::{AtomicArc, Cache, atomic::CachedOrReloaded};
+    use private::Sealed;
+
+    use crate::Resource;
+    mod private {
+        pub trait Sealed {}
+    }
+
+    pub trait T: Sealed {
+        type Body<T: Resource>;
+        type ResourceRef<'a, T: 'a>;
+
+        fn define<T: Resource>(definition: T::Definition, instance: T) -> Self::Body<T>;
+        fn load<'a, T: Resource>(ptr: &Self::Body<T>) -> Self::ResourceRef<'_, T>;
+    }
+
+    pub struct Static;
+    impl Sealed for Static {}
+    impl T for Static {
+        type Body<T: Resource> = T;
+        type ResourceRef<'a, T: 'a> = &'a T;
+
+        fn define<T: Resource>(_: T::Definition, instance: T) -> Self::Body<T> {
+            instance
+        }
+
+        fn load<'a, T: Resource>(ptr: &Self::Body<T>) -> Self::ResourceRef<'_, T> {
+            &ptr
+        }
+    }
+
+    // Store resource definition inline to allow for updates
+    pub struct ReloadablePointer<T: Resource> {
+        pub(crate) definition: T::Definition,
+        pub(crate) cached_ptr: hazarc::Cache<AtomicArc<T>>,
+    }
+
+    pub struct Reloadable;
+    impl Sealed for Reloadable {}
+    impl T for Reloadable {
+        type Body<T: Resource> = ReloadablePointer<T>;
+        type ResourceRef<'a, T: 'a> = CachedOrReloaded<'a, Arc<T>>;
+
+        fn define<T: Resource>(definition: T::Definition, instance: T) -> Self::Body<T> {
+            let ptr = Arc::new(instance);
+            let hazard_ptr = AtomicArc::new(ptr);
+            let cached_ptr = Cache::new(hazard_ptr);
+
+            ReloadablePointer {
+                definition,
+                cached_ptr,
+            }
+        }
+
+        fn load<'a, T: Resource>(ptr: &Self::Body<T>) -> Self::ResourceRef<'_, T> {
+            ptr.cached_ptr.load_shared()
+        }
+    }
+}
 
 // TODO: if we abandon Cache, we can return fully owned ArcBorrows from read,
-// turning resources from `static` to `const` and never requiring $mut (no this! macro)
+// turning resources from `static` to `const`
 //
 // while for our very-infrequent-update case the benefits of Cache (probably) outweight
 // drawbacks, a proper benchmark would be nice
@@ -16,6 +77,7 @@ use hazarc::{AtomicArc, Cache, atomic::CachedOrReloaded};
 pub trait Resource: Sized {
     type Definition;
     type Error;
+    type Kind: kind::T; // TODO: also consider const-generic bool RELOADABLE
 
     fn name() -> &'static str {
         type_name::<Self>()
@@ -24,26 +86,8 @@ pub trait Resource: Sized {
     async fn load(definition: &Self::Definition) -> Result<Self, Self::Error>;
 }
 
-pub type ResourceRef<T> = CachedOrReloaded<'static, Arc<T>>;
-
 pub struct ResourceCell<T: Resource + 'static> {
-    cell: OnceLock<ResourcePointer<T>>,
-}
-
-// Store resource definition inline to allow for updates
-struct ResourcePointer<T: Resource> {
-    definition: T::Definition,
-    cached_ptr: hazarc::Cache<AtomicArc<T>>,
-}
-
-// Expects the `self` cell to be initialized
-macro_rules! this {
-    ($self:ident) => {
-        $self
-            .cell
-            .get()
-            .expect(&format!("'{}' not initialized", T::name()))
-    };
+    cell: OnceLock<<T::Kind as kind::T>::Body<T>>,
 }
 
 impl<T: Resource> ResourceCell<T> {
@@ -57,16 +101,9 @@ impl<T: Resource> ResourceCell<T> {
     /// It is recommended to call it from `main`
     pub async fn init(&self, definition: T::Definition) -> Result<(), T::Error> {
         let instance = T::load(&definition).await?;
-        let ptr = AtomicArc::from(instance);
-        let cached_ptr = Cache::new(ptr);
+        let body = <T::Kind as kind::T>::define(definition, instance);
 
-        // Store the defintion alongside pointer to allow for updates
-        let resource_ptr = ResourcePointer {
-            definition,
-            cached_ptr,
-        };
-
-        let ret = self.cell.set(resource_ptr);
+        let ret = self.cell.set(body);
         if ret.is_err() {
             panic!("'{}' is initialized twice", T::name())
         }
@@ -74,46 +111,64 @@ impl<T: Resource> ResourceCell<T> {
         Ok(())
     }
 
+    fn expect_init(&self) -> &<T::Kind as kind::T>::Body<T> {
+        self.cell
+            .get()
+            .expect(&format!("'{}' not initialized", T::name()))
+    }
+
     /// This function is very cheap to call
     ///
     /// For initial data (before a reload), performance should be
-    /// comparable to a 'static pointer dereference
+    /// comparable to a 'static pointer dereference under black_box
     ///
     /// For hot-reloaded data, performance is comparable to
     /// loading from arc-swap (still very fast)
-    pub fn read(&self) -> CachedOrReloaded<'_, Arc<T>> {
-        let this = this!(self);
-        this.cached_ptr.load_shared()
+    pub fn require(&self) -> <T::Kind as kind::T>::ResourceRef<'_, T> {
+        let this = self.expect_init();
+        <T::Kind as kind::T>::load(&this)
     }
+}
 
+impl<T: Resource<Kind = kind::Reloadable>> ResourceCell<T> {
     pub fn manual_update(&self, new: T) {
-        let this = this!(self);
-        this.cached_ptr.inner().store(new.into());
+        let this = self.expect_init();
+
+        let new_ptr = Arc::new(new);
+        this.cached_ptr.inner().store(new_ptr);
     }
 
     pub async fn reload(&self) -> Result<(), T::Error> {
-        let this = this!(self);
+        let this = self.expect_init();
 
-        let new_instance = T::load(&this.definition).await?.into();
-        this.cached_ptr.inner().store(new_instance);
+        let new_instance = T::load(&this.definition).await?;
+        let new_ptr = Arc::new(new_instance);
+
+        this.cached_ptr.inner().store(new_ptr);
 
         Ok(())
     }
 }
 
 #[cfg(feature = "bundle")]
+#[doc(hidden)]
+pub use paste::paste as __paste;
+
+// TODO: proper error here (anyhow/eyre?)
+#[cfg(feature = "bundle")]
 #[macro_export]
 macro_rules! resources {
     ($vis:vis $name:ident {
         $($resource:ident: $type:ty),* $(,)?
     }) => {
-        $vis mod $name { paste::paste! {
+        $vis mod $name { $crate::__paste! {
             use super::*;
             use $crate::{Resource, ResourceCell};
 
             $(pub static [<$resource:upper>]: ResourceCell<$type> = ResourceCell::new();)*
 
             pub async fn init($([<$resource:lower>]: <$type as Resource>::Definition),*) -> Result<(), String> {
+                let ret;
                 $crate::resources!(@parallel "Initializing" ret => {
                     $($resource.init([<$resource:lower>]))* }
                 );
@@ -122,20 +177,21 @@ macro_rules! resources {
 
 
             pub async fn reload_all() -> Result<(), String> {
+                let ret;
                 $crate::resources!(@parallel "Reloading" ret => { $($resource.reload())* });
                 ret
             }
         }}
     };
 
-    (@parallel $action:literal $ret:ident => { $( $resource:ident . $fn:tt($($arg:tt)?) )* }) => { paste::paste! {
+    (@parallel $action:literal $ret:ident => { $( $resource:ident . $fn:tt($($arg:tt)?) )* }) => { $crate::__paste! {
         let mut tasks = tokio::task::JoinSet::new();
 
-        $(tasks.spawn(async {
+        $(tasks.spawn(async move {
             [<$resource:upper>].$fn($($arg)?).await
             .map_err(|e| format!("{} resource {} failed: {e:?}", $action, stringify!($resource)))
         });)*
 
-        let $ret = tasks.join_all().await.into_iter().collect();
+        $ret = tasks.join_all().await.into_iter().collect();
     }};
 }

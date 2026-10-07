@@ -1,6 +1,6 @@
 use std::{fs, io, path::PathBuf};
 
-use static_reload::{Resource, ResourceCell};
+use static_reload::{Resource, ResourceCell, kind};
 use tokio::signal::unix::SignalKind;
 
 struct FileData(Vec<u8>);
@@ -8,6 +8,7 @@ struct FileData(Vec<u8>);
 impl Resource for FileData {
     type Definition = PathBuf;
     type Error = io::Error;
+    type Kind = kind::Reloadable;
 
     async fn load(path: &Self::Definition) -> Result<Self, Self::Error> {
         let buf = fs::read(path)?;
@@ -29,7 +30,7 @@ async fn main() {
 
 async fn any_function() {
     // Reading a resource is very fast (and doesn't require .await!)
-    let blob = BLOB.read();
+    let blob = BLOB.require();
     println!("The length of blob is: {} bytes", blob.0.len());
 
     // You can trigger a reload from anywhere

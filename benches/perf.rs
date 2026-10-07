@@ -33,10 +33,10 @@ async fn main() {
 
 #[divan::bench]
 fn load_resource() -> ResourceRef<Noop> {
-    black_box(&RESOURCE).read()
+    black_box(&RESOURCE).require()
 }
 
 #[divan::bench]
 fn load_reloaded_resource() -> ResourceRef<Noop> {
-    black_box(&RELOADED_RESOURCE).read()
+    black_box(&RELOADED_RESOURCE).require()
 }
