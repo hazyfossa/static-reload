@@ -33,6 +33,11 @@ pub mod kind {
 
     #[cfg(feature = "reload")]
     pub struct Reloadable;
+
+    #[cfg(feature = "reload")]
+    pub(crate) type DefaultKind = Reloadable;
+    #[cfg(not(feature = "reload"))]
+    pub(crate) type DefaultKind = Static;
 }
 
 #[cfg(feature = "reload")]
@@ -57,7 +62,7 @@ pub trait Resource: Sized {
     async fn load(definition: &Self::Definition) -> Result<Self, Self::Error>;
 }
 
-pub struct ResourceCell<T: Resource + 'static, Kind: kind::T = kind::Reloadable> {
+pub struct ResourceCell<T: Resource + 'static, Kind: kind::T = kind::DefaultKind> {
     cell: OnceLock<Kind::Body<T>>,
 }
 
